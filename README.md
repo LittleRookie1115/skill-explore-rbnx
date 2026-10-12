@@ -38,8 +38,11 @@ explore_rbnx/
 │   └── srv/{Explore,GetExploreStatus,CancelExplore}.srv
 ├── explore_skill/           # python module
 │   ├── atlas_bridge.py      # entrypoint: register + serve MCP
-│   ├── frontier.py          # WFD + clustering + scoring + safety
-│   └── controller.py        # state machine, frontier loop, sweep
+│   ├── controller.py        # task state machine and frontier loop
+│   ├── frontier.py          # frontier search, clustering, goals, costmap overlay
+│   ├── strategies.py        # frontier_greedy and mrtsp
+│   ├── map_opt.py           # map cleaning for mrtsp
+│   └── soma.py              # robot radius from Soma's footprint
 ├── scripts/{build,start}.sh
 ├── docker/{Dockerfile, entrypoint.sh, no_shm_profile.xml}
 ├── CAPABILITY.md            # LLM-readable spec (registered with atlas)
