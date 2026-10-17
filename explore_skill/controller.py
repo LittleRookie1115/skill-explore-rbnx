@@ -544,7 +544,11 @@ class ExploreController:
         every frontier ends. Otherwise mrtsp relaxes the room a goal needs
         and falls back to a greedy goal before it ends, and greedy turns in
         place to see more before it gives up."""
-        if view.frontiers == 0:
+        # The gated count can be zero only because unknown runs alongside the
+        # corridor ahead (the wedge a lidar leaves); that is tried below
+        # before the run ends.
+        wedge_only = view.frontiers == 0 and self.min_passage_m > 0 and view.pose is not None
+        if view.frontiers == 0 and not wedge_only:
             return _Step(end=("done",
                               f"no frontiers left (area={view.area_m2:.1f}m²)"))
         if time.time() - handle.last_progress_t > self.NO_PROGRESS_TIMEOUT_S:
@@ -575,6 +579,12 @@ class ExploreController:
                         mrtsp=self.mrtsp, min_passage_m=self.min_passage_m,
                         **args)
 
+        if wedge_only:
+            target = goal(keep_off_unknown=False)
+            if target is not None:
+                return _Step(target=target)
+            return _Step(end=("done",
+                              f"no frontiers left (area={view.area_m2:.1f}m²)"))
         target = goal(max_distance_m=self.MAX_FRONTIER_DISTANCE_M)
         if target is None:
             target = goal()
