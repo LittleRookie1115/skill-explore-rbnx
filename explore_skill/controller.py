@@ -588,6 +588,13 @@ class ExploreController:
                           min_size=self.CLOSE_LOOK_MIN_SIZE_CELLS)
             if target is not None:
                 return _Step(target=target, close=True)
+        if self.min_passage_m > 0:
+            # Before giving up on the corridor: frontier the gate cut off only
+            # because unknown runs alongside it (the wedge a lidar leaves
+            # ahead in a long corridor), still through openings as wide.
+            target = goal(keep_off_unknown=False)
+            if target is not None:
+                return _Step(target=target)
         if tried and goal(blocked_xy=None) is not None:
             # Every frontier left has been tried: done if any was reached.
             return _Step(end=("done" if handle.reached_targets else "error",

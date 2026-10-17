@@ -242,3 +242,65 @@ def test_a_corridor_end_keeps_a_frontier_long_enough_for_mrtsp():
     t = pick("mrtsp", _grid(data), (2.0, 2.0), min_size=20,
              robot_radius_m=RADIUS, min_passage_m=PASSAGE)
     assert t is not None and t.centroid_xy[0] > 9.5
+
+
+def _wedge_corridor():
+    """Regression (sim run tiago-on-east2): a 2.6 m corridor x 0-20, the
+    robot at x 2 looking along it. Beams near the axis found nothing in
+    range, so a wedge of unknown opens ahead of the robot; the strips of
+    free space beside it are known up to x 12. A 0.9 m door at x 6
+    opens into a room the lidar saw a little of."""
+    data = np.full((_c(8.0), _c(20.0)), UNKNOWN, dtype=np.int8)
+    _box(data, 0.0, 20.0, 2.0, 2.1, WALL)
+    _box(data, 0.0, 20.0, 4.7, 4.8, WALL)
+    _box(data, 0.0, 12.0, 2.1, 4.7, FREE)
+    for x in np.arange(2.6, 12.0, RES):          # the wedge, 10 degrees each side
+        half = (x - 2.4) * math.tan(math.radians(10))
+        _box(data, x, x + RES, 3.4 - half, 3.4 + half, UNKNOWN)
+    _box(data, 6.0, 6.9, 2.0, 2.1, FREE)          # the door, both jambs mapped
+    _box(data, 5.5, 7.4, 0.5, 2.0, FREE)
+    return _grid(data)
+
+
+def test_a_wedge_ahead_does_not_end_the_corridor():
+    gv, robot = _wedge_corridor(), (2.0, 3.4)
+    apex = (2.8, 3.4)
+    strict = _pick("mrtsp", gv, robot, blocked_xy=[apex])
+    assert strict is None or strict.centroid_xy[0] < 4.0
+    t = pick("mrtsp", gv, robot, min_size=8, robot_radius_m=RADIUS,
+             min_passage_m=PASSAGE, blocked_xy=[apex], keep_off_unknown=False)
+    assert t is not None and t.centroid_xy[0] > 4.0
+    assert 2.1 < t.centroid_xy[1] < 4.7 and 2.1 < t.drive_to[1] < 4.7
+
+
+def test_without_keeping_off_unknown_the_door_still_shuts():
+    gv, robot = _wedge_corridor(), (2.0, 3.4)
+    blocked = []
+    for _ in range(10):
+        t = pick("mrtsp", gv, robot, min_size=8, robot_radius_m=RADIUS,
+                 min_passage_m=PASSAGE, blocked_xy=blocked, keep_off_unknown=False)
+        if t is None:
+            break
+        assert t.centroid_xy[1] > 2.1 and t.drive_to[1] > 2.1, t.centroid_xy
+        blocked.append(t.centroid_xy)
+
+
+@pytest.mark.parametrize("passage", (0.0, PASSAGE))
+def test_a_frontier_still_there_after_a_visit_is_tried_at_its_far_part(passage):
+    """Only the cells near a tried frontier are given up: a 6 m frontier
+    along the corridor's edge, tried at its east end, is tried again west."""
+    data = np.full((_c(5.0), _c(14.0)), UNKNOWN, dtype=np.int8)
+    _box(data, 0.0, 14.0, 0.9, 1.0, WALL)
+    _box(data, 0.0, 14.0, 1.0, 3.6, FREE)          # corridor 2.6 m, north side unseen
+    _box(data, 0.0, 0.1, 0.9, 3.6, WALL)
+    _box(data, 13.9, 14.0, 0.9, 3.6, WALL)
+    _box(data, 0.1, 13.9, 3.6, 3.7, UNKNOWN)
+    gv = _grid(data)
+    first = pick("mrtsp", gv, (12.0, 2.3), min_size=20, robot_radius_m=RADIUS,
+                 min_passage_m=passage)
+    assert first is not None
+    again = pick("mrtsp", gv, (12.0, 2.3), min_size=20, robot_radius_m=RADIUS,
+                 min_passage_m=passage, blocked_xy=[first.centroid_xy])
+    assert again is not None
+    assert math.hypot(again.centroid_xy[0] - first.centroid_xy[0],
+                      again.centroid_xy[1] - first.centroid_xy[1]) > 1.0
