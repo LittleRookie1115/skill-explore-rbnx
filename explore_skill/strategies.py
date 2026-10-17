@@ -259,25 +259,37 @@ def _in_opening(gv: GridView, cells: np.ndarray, width_m: float) -> np.ndarray:
     return out
 
 
-def passage_frontier_cells(gv: GridView, reach: "_Reach",
-                           min_passage_m: float) -> np.ndarray:
-    """Frontier cells, and with `min_passage_m` only those next to space
-    `reach` got to through openings that wide and outside any narrower
-    opening. Filtered before clustering: a frontier running from the
-    corridor through a doorway into a room keeps its corridor part only."""
+# What is left of a frontier after the gate trims it, at the least. The
+# gate keeps the corridor end's frontier off the walls by the gate's
+# half-width, so a 2 m corridor keeps about 1 m of it.
+_KEPT_MIN_CELLS = 8
+
+
+def passage_frontiers(gv: GridView, reach: "_Reach", min_passage_m: float,
+                      min_size: int) -> List[FrontierCluster]:
+    """Frontier clusters of at least `min_size` cells; with `min_passage_m`,
+    only their cells next to space `reach` got to through openings that
+    wide and outside any narrower opening, clustered again. Cells are
+    filtered, not clusters: a frontier running from the corridor through
+    a doorway into a room keeps its corridor part only."""
     cells = find_frontier_cells(gv)
-    if min_passage_m <= 0 or cells.size == 0:
-        return cells
-    keep = reach.reached(cells) & ~_in_opening(gv, cells, min_passage_m)
-    return cells[keep]
+    if cells.size == 0:
+        return []
+    clusters = cluster_frontiers(cells, min_size=min_size)
+    if min_passage_m <= 0 or not clusters:
+        return clusters
+    cells = np.concatenate([c.cell_indices for c in clusters])
+    cells = cells[reach.reached(cells) & ~_in_opening(gv, cells, min_passage_m)]
+    if cells.size == 0:
+        return []
+    return cluster_frontiers(cells, min_size=min(min_size, _KEPT_MIN_CELLS))
 
 
 def passage_frontier_count(gv: GridView, robot_xy, *, robot_radius_m: float,
                            min_passage_m: float, min_size: int) -> int:
-    """How many frontier clusters `passage_frontier_cells` leaves."""
+    """How many frontier clusters `passage_frontiers` leaves."""
     reach = _Reach(gv, robot_xy, robot_radius_m, min_passage_m=min_passage_m)
-    cells = passage_frontier_cells(gv, reach, min_passage_m)
-    return len(cluster_frontiers(cells, min_size=min_size)) if cells.size else 0
+    return len(passage_frontiers(gv, reach, min_passage_m, min_size))
 
 
 def _candidates(gv: GridView, robot_xy, *, min_size, robot_radius_m,
@@ -288,11 +300,8 @@ def _candidates(gv: GridView, robot_xy, *, min_size, robot_radius_m,
         return []
     reach = _Reach(gv, robot_xy, robot_radius_m, keepout, room_margin_m,
                    min_passage_m)
-    cells = passage_frontier_cells(gv, reach, min_passage_m)
-    if cells.size == 0:
-        return []
     out = []
-    for c in cluster_frontiers(cells, min_size=min_size):
+    for c in passage_frontiers(gv, reach, min_passage_m, min_size):
         center = gv.cell_to_world(*anchor_cell(c))
         if blocked_xy and any(math.hypot(center[0] - bx, center[1] - by)
                               <= blocked_radius_m for bx, by in blocked_xy):
@@ -441,11 +450,8 @@ def pick(strategy: str, gv: GridView, robot_xy: Tuple[float, float], *,
                                keepout=keepout, **frontier_kwargs)
         reach = _Reach(gv, robot_xy, robot_radius_m, keepout,
                        min_passage_m=min_passage_m)
-        cells = passage_frontier_cells(gv, reach, min_passage_m)
-        if cells.size == 0:
-            return None
         scored = score_clusters(
-            cluster_frontiers(cells, min_size=min_size), gv, robot_xy,
+            passage_frontiers(gv, reach, min_passage_m, min_size), gv, robot_xy,
             max_distance_m=max_distance_m, visited_cells=visited_cells,
             blocked_xy=blocked_xy, blocked_radius_m=blocked_radius_m,
             keepout=keepout, **frontier_kwargs)

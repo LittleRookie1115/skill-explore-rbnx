@@ -15,11 +15,11 @@ from types import SimpleNamespace as NS
 import numpy as np
 import pytest
 
-from explore_skill.frontier import (GridView, cluster_frontiers,
+from explore_skill.frontier import (GridView, cluster_frontiers, pad_unknown,
                                     find_frontier_cells, overlay_lethal)
 from explore_skill.map_opt import optimize
 from explore_skill.strategies import (_Reach, config_problem, pick,
-                                      passage_frontier_cells,
+                                      passage_frontiers,
                                       passage_frontier_count)
 
 FREE, UNKNOWN, WALL = 0, -1, 100
@@ -94,7 +94,9 @@ def _all_picks(strategy, gv, robot=START, passage=PASSAGE):
 
 def _cells(gv, passage=PASSAGE, robot=START):
     reach = _Reach(gv, robot, RADIUS, min_passage_m=passage)
-    return _world(passage_frontier_cells(gv, reach, passage))
+    return _world(np.concatenate([c.cell_indices for c in
+                                  passage_frontiers(gv, reach, passage, 1)]
+                                 or [np.zeros((0, 2), int)]))
 
 
 def test_min_passage_m_is_checked_at_init():
@@ -197,3 +199,46 @@ def test_a_robot_beside_the_wall_still_finds_the_corridor(strategy):
     robot = (14.0, 5.0 + 0.3)
     t = _pick(strategy, gv, robot)
     assert t is not None and not _in_room(*t.centroid_xy)
+
+
+def _start_between_doors(door_south, door_north):
+    """The sim run's start: a 2.2 m corridor along y 0-2.2, the robot just
+    east of a door on each side, everything west of it unseen and the map
+    cropped there, as SLAM crops it. Rooms behind the doors are unseen."""
+    data = np.full((_c(2.4), _c(12.0)), UNKNOWN, dtype=np.int8)
+    _box(data, 0.0, 12.0, 0.0, 0.1, WALL)
+    _box(data, 0.0, 12.0, 2.3, 2.4, WALL)
+    _box(data, 0.0, 12.0, 0.1, 2.3, FREE)
+    for (x0, x1), (y0, y1) in ((door_south, (0.0, 0.1)), (door_north, (2.3, 2.4))):
+        if x0 is not None:
+            _box(data, x0, x1, y0, y1, FREE)
+    gv = _grid(data)
+    # Shift so the grid starts at x = 3.65, the robot at 4.0.
+    return GridView(data=gv.data, resolution=RES, origin_x=3.65,
+                    origin_y=-0.1, width=gv.width, height=gv.height)
+
+
+@pytest.mark.parametrize("strategy", STRATEGIES)
+@pytest.mark.parametrize("doors", [((3.65, 3.9), (3.65, 3.9)),    # both sides
+                                   ((3.65, 3.9), (None, None))])  # one side
+def test_the_corridor_behind_the_start_is_explored(strategy, doors):
+    """Regression: the map ended at the robot's back, free to its edge, so
+    the corridor behind the start had no frontier and was never seen."""
+    gv = pad_unknown(_start_between_doors(*doors))
+    robot = (4.0, 1.1)
+    picks = _all_picks(strategy, gv, robot)
+    behind = [t for t in picks if t.centroid_xy[0] < 3.8]
+    assert behind, [t.centroid_xy for t in picks]
+    for t in behind:
+        assert 0.0 <= t.centroid_xy[1] <= 2.2
+
+
+def test_a_corridor_end_keeps_a_frontier_long_enough_for_mrtsp():
+    """The gate trims the frontier off the walls; what is left of a 1.9 m
+    corridor's end must still pass mrtsp's 1 m minimum, judged before."""
+    data = np.full((_c(4.0), _c(12.0)), UNKNOWN, dtype=np.int8)
+    _box(data, 0.5, 10.0, 0.9, 3.0, WALL)
+    _box(data, 0.6, 10.0, 1.0, 2.9, FREE)                # 1.9 m
+    t = pick("mrtsp", _grid(data), (2.0, 2.0), min_size=20,
+             robot_radius_m=RADIUS, min_passage_m=PASSAGE)
+    assert t is not None and t.centroid_xy[0] > 9.5

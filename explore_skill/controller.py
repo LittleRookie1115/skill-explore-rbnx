@@ -485,7 +485,7 @@ class ExploreController:
         optimized map (map_opt.py) and ignores frontiers shorter than
         `min_frontier_m`."""
         from .frontier import (GridView, fill_traversed, mapped_free_area_m2,
-                               total_frontier_count)
+                               pad_unknown, total_frontier_count)
         with self._lock:
             latest = self._latest_map
             pose_xyyaw = self._latest_pose_xyyaw
@@ -493,7 +493,7 @@ class ExploreController:
         if latest is None:
             return None
         pose = pose_xyyaw[:2] if pose_xyyaw else None
-        gv = GridView.from_msg(latest)
+        gv = pad_unknown(GridView.from_msg(latest))
         visited = self._visited_cells(gv, visited_xy)
         area = mapped_free_area_m2(gv)
         # Growth since the last progress, so a map that grows a little every
