@@ -20,7 +20,7 @@ Threading:
 
 Nav integration:
   The skill calls service/navigation/navigate and its status/cancel controls as
-  gRPC RPCs against the endpoints atlas resolved at startup. We do
+  MCP tools against the endpoints atlas resolved at startup. We do
   NOT subscribe to /goal_pose or /cmd_vel — that would skip the nav
   service's contract surface and break the abstraction.
 """
@@ -35,6 +35,22 @@ from dataclasses import dataclass, field
 from typing import Any, List, Optional, Tuple
 
 log = logging.getLogger("explore_rbnx.controller")
+
+
+class _NavigationRunMissing(RuntimeError):
+    pass
+
+
+def _navigation_state(response: Any, run_id: str) -> str:
+    if not isinstance(response, dict):
+        return "unknown"
+    if response.get("known") is False and response.get("detail") == "unknown run_id":
+        raise _NavigationRunMissing(
+            f"navigation no longer knows run_id {run_id}; ownership lost; stop unconfirmed"
+        )
+    if response.get("known") is True:
+        return str(response.get("state", "")).upper()
+    return "unknown"
 
 
 @dataclass
@@ -65,6 +81,7 @@ class TaskHandle:
     nav_starting: bool = False
     nav_start_error: str = ""
     nav_cancel_error: str = ""
+    nav_stop_error: str = ""
     finished_at: Optional[float] = None
 
 
@@ -122,6 +139,7 @@ class ExploreController:
     NAV_RPC_TIMEOUT_S = 5.0
     NAV_CANCEL_POLL_TIMEOUT_S = 2.0
     NAV_CANCEL_POLL_PERIOD_S = 0.2
+    NAV_STOP_WAIT_TIMEOUT_S = 15.0
     LEG_TIMEOUT_PER_M_S = 7.0             # per metre of path, above the minimum
     LOOP_QUIET_PERIOD_S = 2.0             # pause between legs
 
@@ -385,7 +403,7 @@ class ExploreController:
             if task_id and t.task_id != task_id:
                 return False, f"task_id mismatch (active={t.task_id})"
             if t.state != "exploring" and not (
-                t.nav_starting or t.nav_run_id or t.nav_start_error
+                t.nav_starting or t.nav_run_id or t.nav_start_error or t.nav_stop_error
             ):
                 return True, f"task already in terminal state {t.state} (no-op)"
             t.cancel_requested = True
@@ -400,27 +418,38 @@ class ExploreController:
                 run_id = handle.nav_run_id
                 starting = handle.nav_starting
                 start_error = handle.nav_start_error
+                stop_error = handle.nav_stop_error
             if starting:
                 accepted, detail = False, "navigation start pending; stop unconfirmed"
             elif start_error:
                 accepted, detail = False, f"no navigation run_id available; {start_error}"
+            elif not run_id and stop_error:
+                accepted, detail = False, stop_error
             elif not run_id:
                 accepted, detail = True, "no active navigation; local cancel requested"
             else:
                 try:
                     accepted, detail = self._nav_cancel_rpc(run_id)
+                except _NavigationRunMissing as error:
+                    accepted, detail = False, str(error)
+                    with self._lock:
+                        if handle.nav_run_id == run_id:
+                            handle.nav_run_id = ""
+                            handle.nav_stop_error = detail
                 except Exception as error:
                     accepted, detail = False, str(error)
                 if not accepted:
                     detail = f"navigation cancel failed; stop unconfirmed: {detail}"
             with self._lock:
                 if not accepted and not (
-                    handle.nav_starting or handle.nav_run_id or handle.nav_start_error
+                    handle.nav_starting or handle.nav_run_id
+                    or handle.nav_start_error or handle.nav_stop_error
                 ):
                     accepted, detail = True, "navigation is no longer active"
                 handle.nav_cancel_error = "" if accepted else detail
                 if accepted and handle.nav_run_id == run_id:
                     handle.nav_run_id = ""
+                    handle.nav_stop_error = ""
                 if handle.cancel_requested:
                     handle.detail = detail
                     if handle.state != "exploring":
@@ -510,6 +539,8 @@ class ExploreController:
                      deadline: Optional[float]) -> Optional[Tuple[str, str]]:
         if handle.nav_start_error:
             return "error", handle.nav_start_error
+        if handle.nav_stop_error:
+            return "error", handle.nav_stop_error
         if handle.cancel_requested:
             return "canceled", "user-requested cancel"
         if deadline is not None and time.time() > deadline:
@@ -674,6 +705,8 @@ class ExploreController:
             timeout_s=leg_timeout, cancel_evt=handle)
         if handle.nav_start_error:
             return "error", handle.nav_start_error
+        if handle.nav_stop_error:
+            return "error", handle.nav_stop_error
         if handle.cancel_requested:
             return "canceled", "cancel during nav"
         with self._lock:
@@ -704,30 +737,55 @@ class ExploreController:
         return None
 
     def _wait_for_navigation_stop(self, handle: TaskHandle, detail: str) -> bool:
-        """Keep ownership until navigation confirms termination or runtime stops."""
-        accepted, _ = self._cancel_navigation(handle)
-        while not accepted:
+        """Bound worker cleanup while preserving uncertain remote ownership."""
+        deadline = time.monotonic() + self.NAV_STOP_WAIT_TIMEOUT_S
+        while time.monotonic() < deadline:
             with self._lock:
-                if handle.nav_start_error:
+                if handle.nav_start_error or handle.nav_stop_error:
                     return False
+            accepted, _ = self._cancel_navigation(handle)
+            if accepted:
+                return True
+            with self._lock:
+                if handle.nav_start_error or handle.nav_stop_error:
+                    return False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
                 handle.state = "exploring"
                 handle.detail = detail
                 handle.finished_at = None
-            if self._stop_evt.wait(self.NAV_POLL_PERIOD_S):
+            if self._stop_evt.wait(min(self.NAV_POLL_PERIOD_S, remaining)):
+                with self._lock:
+                    handle.nav_stop_error = (
+                        "exploration runtime stopped before navigation termination "
+                        "was confirmed; owned run retained; stop unconfirmed"
+                    )
                 return False
-            accepted, _ = self._cancel_navigation(handle)
-        return True
+        with self._lock:
+            if not (
+                handle.nav_starting or handle.nav_run_id
+                or handle.nav_start_error or handle.nav_stop_error
+            ):
+                return True
+            handle.nav_stop_error = (
+                "navigation stop confirmation timed out; "
+                "owned run retained; stop unconfirmed"
+            )
+        return False
 
     def _terminate(self, handle: TaskHandle, state: str, detail: str) -> None:
         """Retain owned navigation until terminal; report unknown starts explicitly."""
         stopped = self._wait_for_navigation_stop(handle, detail)
         with self._lock:
-            if handle.nav_start_error:
+            problem = handle.nav_start_error or handle.nav_stop_error
+            if problem:
                 state = "error"
-                if handle.nav_start_error not in detail:
-                    detail = f"{detail}; {handle.nav_start_error}"
-            elif not stopped:
-                return
+                if problem not in detail:
+                    detail = f"{detail}; {problem}"
+            elif not stopped and (handle.nav_starting or handle.nav_run_id):
+                state = "error"
+                detail = f"{detail}; navigation stop unconfirmed"
             handle.state = state
             handle.detail = detail
             if handle.finished_at is None:
@@ -968,14 +1026,18 @@ class ExploreController:
                 self._cancel_navigation(cancel_evt)
                 return False, "goal now inside an obstacle in the costmap"
             sresp = self._mcp_call_sync("status", {"run_id": run_id})
-            if isinstance(sresp, dict) and sresp.get("known") is True:
-                state = str(sresp.get("state", "")).upper()
-                if state in (
-                    "SUCCEEDED", "FAILED", "CANCELED", "TIMEOUT",
-                ):
-                    with self._lock:
+            try:
+                state = _navigation_state(sresp, run_id)
+            except _NavigationRunMissing as error:
+                with self._lock:
+                    if cancel_evt.nav_run_id == run_id:
                         cancel_evt.nav_run_id = ""
-                    return state == "SUCCEEDED", f"nav terminal: {state}"
+                        cancel_evt.nav_stop_error = str(error)
+                return False, str(error)
+            if state in ("SUCCEEDED", "FAILED", "CANCELED", "TIMEOUT"):
+                with self._lock:
+                    cancel_evt.nav_run_id = ""
+                return state == "SUCCEEDED", f"nav terminal: {state}"
             time.sleep(self.NAV_POLL_PERIOD_S)
         self._cancel_navigation(cancel_evt)
         return False, "leg timeout"
@@ -1000,10 +1062,8 @@ class ExploreController:
         deadline = time.monotonic() + self.NAV_CANCEL_POLL_TIMEOUT_S
         while True:
             status = self._mcp_call_sync("status", {"run_id": run_id})
-            state = status.get("state", "unknown") if isinstance(status, dict) else "unknown"
-            if isinstance(status, dict) and status.get("known") is True and state in (
-                "SUCCEEDED", "FAILED", "CANCELED", "TIMEOUT",
-            ):
+            state = _navigation_state(status, run_id)
+            if state in ("SUCCEEDED", "FAILED", "CANCELED", "TIMEOUT"):
                 return True, f"navigation already terminal: {state}"
             remaining = deadline - time.monotonic()
             if remaining <= 0:

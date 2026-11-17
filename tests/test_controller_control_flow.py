@@ -476,8 +476,9 @@ class ExploreControlFlowTest(unittest.TestCase):
                 ):
                     self.controller._run_task(handle)
 
-                self.assertEqual(handle.state, "exploring")
-                self.assertIsNone(handle.finished_at)
+                self.assertEqual(handle.state, "error")
+                self.assertIsNotNone(handle.finished_at)
+                self.assertIn("runtime stopped", handle.detail)
                 self.assertEqual(handle.nav_run_id, "nav-shutdown")
                 self.assertTrue(handle.cancel_requested)
                 self.assertIn("stop unconfirmed", self.controller.status(handle.task_id)["detail"])
@@ -665,6 +666,148 @@ class ExploreControlFlowTest(unittest.TestCase):
         self.assertTrue(ok, detail)
         self.assertFalse(handle.nav_starting)
         self.assertEqual(handle.nav_run_id, "")
+
+    def test_rejected_leg_can_choose_another_frontier_and_finish(self) -> None:
+        self.controller._latest_map = _map_msg()
+        self.controller._latest_pose_xyyaw = (5.0, 5.0, 0.0)
+        self.controller.LOOP_QUIET_PERIOD_S = 0.0
+        goals = []
+
+        def rpc_response(tool, args):
+            if tool == "navigate":
+                goals.append(args)
+                if len(goals) == 1:
+                    return {"accepted": False, "run_id": "", "detail": "goal rejected"}
+                self.assertEqual(len(goals), 2)
+                return {"accepted": True, "run_id": "next-leg"}
+            self.assertEqual((tool, args), ("status", {"run_id": "next-leg"}))
+            self.controller._latest_map = _map_msg(pockets=())
+            return {"known": True, "state": "SUCCEEDED"}
+
+        with patch.object(self.controller, "_mcp_call_sync", side_effect=rpc_response):
+            handle = self.controller.start(
+                area_hint="", timeout_s=60.0, max_speed_m_s=0.1,
+            )
+            handle.thread.join(timeout=2.0)
+        self.assertFalse(handle.thread.is_alive())
+        self.assertEqual(handle.state, "done", handle.detail)
+        self.assertEqual(len(goals), 2)
+        self.assertEqual(len(handle.failed_targets), 1)
+        self.assertEqual(handle.legs_completed, 1)
+        self.assertFalse(handle.nav_start_error)
+
+    def test_missing_run_after_restart_releases_ownership_without_confirming_stop(self) -> None:
+        handle = self._handle()
+        handle.nav_run_id = "before-restart"
+        self.controller._task = handle
+        with patch.object(self.controller, "_mcp_call_sync", side_effect=[
+            {"accepted": False, "detail": "unknown run_id"},
+            {"known": False, "state": "FAILED", "detail": "unknown run_id"},
+        ]) as rpc:
+            self.controller._terminate(handle, "canceled", "user requested cancel")
+            self.assertEqual(handle.state, "error", handle.detail)
+            self.assertIn("ownership lost", handle.detail)
+            self.assertIn("stop unconfirmed", handle.detail)
+            self.assertEqual(handle.nav_run_id, "")
+            self.assertIsNotNone(handle.finished_at)
+            ok, detail = self.controller.cancel(handle.task_id)
+            self.assertFalse(ok, detail)
+            self.assertIn("stop unconfirmed", detail)
+            self.assertEqual(rpc.call_count, 2)
+            self.controller._latest_map = _map_msg(pockets=())
+            resumed = self.controller.start(
+                area_hint="", timeout_s=60.0, max_speed_m_s=0.1,
+            )
+            resumed.thread.join(timeout=2.0)
+        self.assertFalse(resumed.thread.is_alive())
+        self.assertEqual(resumed.state, "done", resumed.detail)
+        self.assertNotEqual(resumed.task_id, handle.task_id)
+        self.assertFalse(resumed.nav_stop_error)
+
+    def test_missing_run_during_status_poll_ends_the_leg_without_unscoped_cancel(self) -> None:
+        handle = self._handle()
+        self.controller._task = handle
+        with patch.object(self.controller, "_mcp_call_sync", side_effect=[
+            {"accepted": True, "run_id": "lost-run"},
+            {"known": False, "state": "FAILED", "detail": "unknown run_id"},
+        ]) as rpc:
+            ok, detail = self.controller._nav_navigate_blocking(
+                1.0, 2.0, yaw=None, timeout_s=1.0, cancel_evt=handle,
+            )
+            self.assertFalse(ok, detail)
+            self.controller._terminate(handle, "done", detail)
+        self.assertEqual(handle.state, "error")
+        self.assertEqual(handle.nav_run_id, "")
+        self.assertIn("ownership lost", handle.detail)
+        self.assertEqual(rpc.call_args_list, [
+            call("navigate", unittest.mock.ANY),
+            call("status", {"run_id": "lost-run"}),
+        ])
+
+    def test_unconfirmed_stop_has_a_bounded_worker_but_retains_the_exact_run(self) -> None:
+        self.controller.NAV_STOP_WAIT_TIMEOUT_S = 0.02
+        self.controller.NAV_POLL_PERIOD_S = 0.002
+        handle = self._handle()
+        handle.nav_run_id = "still-owned"
+        self.controller._task = handle
+        started = time.monotonic()
+        with patch.object(self.controller, "_mcp_call_sync", return_value={}) as rpc:
+            self.controller._terminate(handle, "done", "no frontiers left")
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertEqual(handle.state, "error")
+            self.assertIn("confirmation timed out", handle.detail)
+            self.assertIn("stop unconfirmed", handle.detail)
+            self.assertEqual(handle.nav_run_id, "still-owned")
+            self.assertIsNotNone(handle.finished_at)
+            with self.assertRaises(RuntimeError):
+                self.controller.start(
+                    area_hint="", timeout_s=60.0, max_speed_m_s=0.1,
+                )
+            for rpc_call in rpc.call_args_list:
+                self.assertEqual(rpc_call.args[1], {"run_id": "still-owned"})
+            rpc.side_effect = [
+                {"accepted": True},
+                {"known": True, "state": "CANCELED"},
+            ]
+            ok, detail = self.controller.cancel(handle.task_id)
+        self.assertTrue(ok, detail)
+        self.assertEqual(handle.nav_run_id, "")
+        self.assertFalse(handle.nav_stop_error)
+        self.assertFalse(handle.nav_cancel_error)
+
+    def test_transport_exception_text_cannot_prove_a_run_is_missing(self) -> None:
+        self.controller.NAV_STOP_WAIT_TIMEOUT_S = 0.01
+        self.controller.NAV_POLL_PERIOD_S = 0.002
+        handle = self._handle()
+        handle.nav_run_id = "still-owned"
+        self.controller._task = handle
+        with patch.object(
+            self.controller, "_mcp_call",
+            new=AsyncMock(side_effect=RuntimeError("unknown run_id")),
+        ):
+            self.controller._terminate(handle, "canceled", "cancel requested")
+        self.assertEqual(handle.state, "error")
+        self.assertEqual(handle.nav_run_id, "still-owned")
+        self.assertNotIn("ownership lost", handle.nav_stop_error)
+        self.assertIn("stop unconfirmed", handle.detail)
+
+    def test_terminal_status_winning_the_cleanup_timeout_race_still_finishes_the_task(self) -> None:
+        handle = self._handle()
+        handle.nav_run_id = "race-run"
+
+        def confirmed_by_another_caller(_handle, _detail):
+            handle.nav_run_id = ""
+            handle.nav_stop_error = ""
+            return False
+
+        with patch.object(
+            self.controller, "_wait_for_navigation_stop",
+            side_effect=confirmed_by_another_caller,
+        ):
+            self.controller._terminate(handle, "timeout", "hit ceiling")
+        self.assertEqual(handle.state, "timeout")
+        self.assertEqual(handle.detail, "hit ceiling")
+        self.assertIsNotNone(handle.finished_at)
 
     def test_cancel_forwards_only_the_owned_navigation_run_id(self) -> None:
         handle = self._handle()

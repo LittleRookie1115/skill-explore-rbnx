@@ -43,19 +43,32 @@ Only `known=true` with `SUCCEEDED`, `FAILED`, `CANCELED` or `TIMEOUT` confirms
 completion, even if the cancel acknowledgement was lost or rejected.
 
 If an owned run cannot be confirmed terminal, cancellation returns
-`ok=false` with an explicit `stop unconfirmed` message. The controller retains
-that id and its worker retries once per second after each bounded attempt.
-Status stays `RUNNING` with the original termination reason and
-`stop unconfirmed` until navigation reports a known terminal state.
-A new exploration cannot overwrite that unresolved navigation run.
-Once confirmed, ordinary leg and sweep failures resume their existing retry
-handling. For task-ending conditions, the original terminal state and reason
-are reported, and elapsed time freezes.
+`ok=false` with an explicit `stop unconfirmed` message. Worker cleanup retries
+once per second within a 15-second window; an RPC already in flight retains
+its five-second deadline. On expiry or runtime shutdown, the task ends locally
+as `FAILED`, elapsed time freezes, and its exact navigation id remains available
+for an explicit cancellation retry. A new exploration cannot overwrite that
+unresolved run. Verified terminal status clears the retained id.
+
+If Navigation explicitly returns `known=false` with `detail="unknown run_id"`,
+the controller releases that obsolete id and ends the task as `FAILED` with
+an ownership-loss warning. Cancel remains `ok=false`: losing Navigation's
+record does not confirm a physical stop. The worker exits and a new exploration
+can start without restarting the skill. A transport failure, malformed reply,
+or an exception containing the same words is not that structured evidence and
+cannot release the id.
+
+Once a stop is confirmed within the cleanup window, ordinary leg and sweep
+failures resume their existing retry handling. For task-ending conditions,
+the original terminal state and reason are reported, and elapsed time freezes.
 
 ### Missing navigation start result
 
 The start-pending flag is cleared on every completed or failed navigate
 request. An explicit `accepted=false` is an ordinary rejected leg.
+A matching Navigation deployment returns that negative contract reply over
+MCP as well as gRPC, so exploration can try another frontier. Unexpected MCP
+errors remain uncertain start outcomes.
 A transport exception, a startup timeout, an unreadable response, or
 `accepted=true` without a nonempty string `run_id` leaves the remote outcome
 unknown: navigation might have started before the reply was lost.
@@ -69,7 +82,8 @@ The local worker exits, elapsed time freezes, and the controller can accept a
 new exploration instead of remaining locked indefinitely.
 
 Accepting a new exploration does not prove that the previous remote goal
-stopped. Before retrying after an unknown start result, the operator must
+stopped. Before retrying after an unknown start result or loss of Navigation's
+run record, the operator must
 verify navigation or stop motion through the deployment's safety controls.
 This skill cannot reconcile a lost start result without a navigation
 protocol that preserves request ownership across retries.
@@ -82,9 +96,10 @@ Run from the package root with Python, NumPy, SciPy and pytest installed:
 python3 -m pytest -q tests
 ```
 
-The control-flow regressions exercise failed and timed out starts, local
-termination and restart, delayed cancellation, unconfirmed status, and exact
-navigation run ownership. Frontier selection and exploration policy tests
+The control-flow regressions exercise rejected, failed and timed out starts,
+Navigation restart, bounded stop waiting, local termination and restart,
+delayed cancellation, unconfirmed status, and exact navigation run ownership.
+Frontier selection and exploration policy tests
 remain part of the same suite.
 
 ## Layout
